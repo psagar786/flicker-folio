@@ -1,4 +1,4 @@
-<img src="flicker-folio.png" alt="Flicker Folio logo, a gold camera lens on a red background" width="112">
+<img src="docs/flicker-folio.png" alt="Flicker Folio logo, a gold camera lens on a red background" width="112">
 
 # Flicker Folio
 
@@ -32,6 +32,23 @@ Requires **macOS 15 or later** and Apple’s **Xcode 16 or newer**, or matching 
 4. To keep the app, copy it from `dist` into Applications using Finder. Quit any running Flicker Folio instance before replacing it. The bundle identity is retained so upgrades can use existing scripts and settings.
 
 The build script ad-hoc signs the local app. This is a source distribution without Developer ID notarization. Downloading the source and tools requires internet access. The app runs offline after setup. macOS may need to provision the selected on-device speech language first.
+
+## Develop and contribute
+
+Fork the repository on GitHub, then clone your fork. To try the code first, clone the public repository below.
+
+```sh
+git clone https://github.com/psagar786/flicker-folio.git
+cd flicker-folio
+bash ./build-local.sh
+open "dist/Flicker Folio.app"
+```
+
+- [NotchPrompter](NotchPrompter/) contains the macOS app, including the notes editor, prompter, and recording controls.
+- [NotchPrompterKit](NotchPrompterKit/) contains voice matching, speech recognition, note formatting, and script storage.
+- [Tools](Tools/) contains the local regression tests. Run the speech matcher with `zsh Tools/test-matcher.sh`.
+
+Create a branch for your change and run the build before opening a pull request. Describe what changed and how you tested it. For pacing or speech changes, include the mode, WPM, recognition language, and a short fictional script so others can reproduce the behavior.
 
 ## Start reading
 
@@ -68,6 +85,6 @@ Manual scrolling and Timed reading work without microphone, speech, camera, or s
 
 ## Tools and credits
 
-Built with Swift, SwiftUI and AppKit. Apple Speech handles on-device recognition, AVFoundation and Core Audio handle camera and microphone work, ScreenCaptureKit handles screen capture, and Carbon registers optional keyboard shortcuts. Foundation and UniformTypeIdentifiers support local storage and import. The build uses Apple’s `swiftc` and `codesign`. There are no third-party runtime packages or hosted services. The source ZIP includes the complete app and local pacing, speech-matching, and notes regression tests.
+Built with Swift, SwiftUI and AppKit. Apple Speech handles on-device recognition, AVFoundation and Core Audio handle camera and microphone work, ScreenCaptureKit handles screen capture, and Carbon registers optional keyboard shortcuts. Foundation and UniformTypeIdentifiers support local storage and import. The build uses Apple’s `swiftc` and `codesign`. There are no third-party runtime packages or hosted services. The repo includes local pacing, matching, and notes regression tests.
 
 Flicker Folio is free to use and available under the [MIT License](LICENSE). It adapts [NotchPrompter](https://github.com/magnram/notchprompter/tree/9196c3659ac4eec025139d06250c9a0f27b8be15) by Magnus Ramm. The upstream copyright and license are included. Flicker Folio project and product direction by **Sagar Paperwala**.
