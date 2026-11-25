@@ -1,0 +1,189 @@
+import AVFoundation
+import AppKit
+import NotchPrompterKit
+import os
+
+let log = Logger(subsystem: "com.magnusramm.NotchPrompter", category: "voice")
+
+/// Films the camera and microphone into a movie file in Movies › Flicker Folio.
+final class Recorder: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+    /// Called on the main thread when a take is saved (or failed).
+    var onFinished: (_ url: URL?, _ problem: String?) -> Void = { _, _ in }
+    private(set) var isRecording = false
+    private(set) var isWriting = false
+    private(set) var startedAt = Date()
+
+    /// Runs from `prepare` until the take ends; the camera preview shows it.
+    let session = AVCaptureSession()
+    private let output = AVCaptureMovieFileOutput()
+    /// The same microphone audio, for voice-follow while recording (set before `start`).
+    var onAudio: ((CMSampleBuffer) -> Void)?
+    private let audioOutput = AVCaptureAudioDataOutput()
+    private let audioQueue = DispatchQueue(label: "com.magnusramm.NotchPrompter.recorder.audio")
+    private let queue = DispatchQueue(label: "com.magnusramm.NotchPrompter.recorder")
+    private var stopCompletion: (() -> Void)?
+
+    /// The real Movies folder. Inside the sandbox the home directory is the app's container,
+    /// so look up the user's home instead (the app has the Movies folder entitlement).
+    static var folder: URL {
+        let home = getpwuid(getuid()).flatMap { String(validatingCString: $0.pointee.pw_dir) } ?? NSHomeDirectory()
+        return URL(fileURLWithPath: home).appendingPathComponent("Movies/Flicker Folio", isDirectory: true)
+    }
+
+    static func prepareOutputDirectory(_ directory: URL = folder) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    static var cameras: [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
+                                         mediaType: .video, position: .unspecified).devices
+    }
+
+    static var microphones: [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external],
+                                         mediaType: .audio, position: .unspecified).devices
+    }
+
+    /// The chosen microphone, or the system's input when it is `""` or unplugged.
+    static func microphone(_ id: String) -> AVCaptureDevice? {
+        microphones.first { $0.uniqueID == id } ?? AVCaptureDevice.default(for: .audio)
+    }
+
+    static let cameraSettings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")!
+
+    /// Ask for camera (if `camera`) and microphone access. `done` gets nil, or a message and where to fix it.
+    static func requestAccess(camera needsCamera: Bool = true, _ done: @escaping ((message: String, url: URL)?) -> Void) {
+        let askCamera: (@escaping (Bool) -> Void) -> Void = { next in
+            needsCamera ? AVCaptureDevice.requestAccess(for: .video, completionHandler: next) : next(true)
+        }
+        askCamera { camera in
+            guard camera else {
+                return DispatchQueue.main.async {
+                    done((String(localized: "Flicker Folio needs the camera to record you. Turn it on for Flicker Folio in System Settings → Privacy & Security → Camera."), cameraSettings))
+                }
+            }
+            AVCaptureDevice.requestAccess(for: .audio) { mic in
+                DispatchQueue.main.async {
+                    done(mic ? nil : (String(localized: "Flicker Folio needs the microphone to record your voice. Turn it on for Flicker Folio in System Settings → Privacy & Security → Microphone."), VoiceListener.microphoneSettings))
+                }
+            }
+        }
+    }
+
+    private var prepared = false
+    private var startedCallback: ((String?) -> Void)?
+
+    /// Turn on the camera and microphone without saving anything yet, so a take can start
+    /// instantly (the camera needs a second or so to wake up). `ready` gets nil or a problem.
+    func prepare(cameraID: String, microphoneID: String, ready: @escaping (String?) -> Void) {
+        guard !isRecording else { return ready(nil) }
+        let camera = Self.cameras.first { $0.uniqueID == cameraID } ?? AVCaptureDevice.default(for: .video)
+        guard let camera else { return ready(String(localized: "No camera found.")) }
+        guard let mic = Self.microphone(microphoneID) else { return ready(String(localized: "No microphone found.")) }
+
+        queue.async { [self] in
+            do {
+                try Self.prepareOutputDirectory()
+                do {
+                    session.beginConfiguration()
+                    defer { session.commitConfiguration() }
+                    session.inputs.forEach(session.removeInput)
+                    session.outputs.forEach(session.removeOutput)
+                    session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
+                    for input in [try AVCaptureDeviceInput(device: camera), try AVCaptureDeviceInput(device: mic)] {
+                        guard session.canAddInput(input) else { throw RecorderError.setup }
+                        session.addInput(input)
+                    }
+                    guard session.canAddOutput(output) else { throw RecorderError.setup }
+                    session.addOutput(output)
+                    audioOutput.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
+                                                 AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false,
+                                                 AVNumberOfChannelsKey: 1, AVSampleRateKey: 16_000]
+                    audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+                    if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
+                }
+                session.startRunning()
+                DispatchQueue.main.async { self.prepared = true; ready(nil) }
+            } catch {
+                session.stopRunning()
+                log.error("recorder: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    ready(String(localized: "Couldn't start recording: \(error.localizedDescription)",
+                                 comment: "The placeholder is the system's error message"))
+                }
+            }
+        }
+    }
+
+    /// Start saving the take (after `prepare`). `started` runs when the first frames are written.
+    func record(name: String, started: @escaping (String?) -> Void) {
+        guard prepared, !isRecording else { return started(prepared ? nil : String(localized: "The camera isn't ready.")) }
+        isRecording = true
+        startedAt = Date()
+        startedCallback = started
+        queue.async { [self] in
+            output.startRecording(to: Self.folder.appendingPathComponent(name + ".mov"), recordingDelegate: self)
+        }
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
+        DispatchQueue.main.async {
+            self.isWriting = true
+            self.startedAt = Date()
+            self.startedCallback?(nil)
+            self.startedCallback = nil
+        }
+    }
+
+    /// Stop the take. The file is finished when `onFinished` runs (then `completion`).
+    func stop(completion: (() -> Void)? = nil) {
+        guard isRecording else {
+            // Prepared but never started (cancelled during the countdown): just turn the camera off.
+            if prepared { prepared = false; queue.async { self.session.stopRunning() } }
+            completion?()
+            return
+        }
+        prepared = false
+        stopCompletion = completion
+        queue.async { self.output.stopRecording() }
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo url: URL,
+                    from connections: [AVCaptureConnection], error: Error?) {
+        // An error can still mean a good file (e.g. the disk filled up after some seconds).
+        let ok = error == nil
+            || ((error as NSError?)?.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool ?? false)
+        queue.async { self.session.stopRunning() }
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.isWriting = false
+            self.startedCallback = nil
+            self.onFinished(ok ? url : nil, ok ? nil : String(localized: "The recording couldn't be saved: \(error?.localizedDescription ?? "")",
+                                                              comment: "The placeholder is the system's error message"))
+            self.stopCompletion?()
+            self.stopCompletion = nil
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        onAudio?(sampleBuffer)
+    }
+
+    /// "Flicker Folio 2026-09-23 at 11.28.26", shared by the camera and screen movies of one take.
+    static func takeName() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        let date = f.string(from: Date())
+        f.dateFormat = "HH.mm.ss"
+        let time = f.string(from: Date())
+        return String(localized: "Flicker Folio \(date) at \(time)",
+                      comment: "File name of a recording, like macOS screenshots: “Flicker Folio 2026-09-23 at 11.28.26”. No / or :")
+    }
+
+    private enum RecorderError: LocalizedError {
+        case setup
+        var errorDescription: String? { String(localized: "The camera or microphone is busy.") }
+    }
+}

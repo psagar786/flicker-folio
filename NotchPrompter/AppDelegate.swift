@@ -1,0 +1,450 @@
+import AppKit
+import SwiftUI
+import NotchPrompterKit
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    private let settings = AppSettings.shared
+    private let library = ScriptLibrary.shared
+    private var prompter: Prompter!
+    private var statusItem: NSStatusItem!
+    private var editorWindow: NSWindow?
+    private var settingsWindow: NSWindow?
+    private var advancedSettingsWindow: NSWindow?
+    private var scriptSwitcher: NSWindow?
+    private var statusMenu: NSMenu?
+    private var welcomeWindow: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildMainMenu()
+        prompter = Prompter(settings: settings, library: library)
+        prompter.onOpenEditor = { [unowned self] in showEditor() }
+        prompter.onOpenSettings = { [unowned self] in showSettings() }
+        prompter.onSwitchScript = { [unowned self] in showScriptSwitcher() }
+        _ = ScriptFolder.shared   // start syncing the scripts folder, if one is chosen
+        GlobalShortcuts.shared.onAction = { [unowned self] action in
+            switch action {
+            case .showPrompter: prompter.togglePanel()
+            case .pauseResume: prompter.pauseOrResume()
+            case .record: prompter.toggleRecording()
+            }
+        }
+        GlobalShortcuts.shared.start(settings)
+        buildStatusItem()
+        if !pendingURLs.isEmpty { application(NSApp, open: pendingURLs) }
+        pendingURLs = []
+
+        #if DEBUG
+        if let folder = ScreenshotRenderer.outputFolder {
+            // A timer, not the main queue: the renderer spins the run loop and needs queued work to run.
+            Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { _ in
+                MainActor.assumeIsolated { ScreenshotRenderer.run(prompter: self.prompter, folder: folder) }
+            }
+            return
+        }
+        if let movie = TakeTranscriber.selfTestMovie {
+            TakeTranscriber.runSelfTest(movie)
+            return
+        }
+        if MicSelfTest.requested {
+            prompter.showPanel()
+            MicSelfTest.run(prompter: prompter)
+            return
+        }
+        #endif
+        if settings.hasSeenWelcome { showEditor() }
+        else { showWelcome() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showEditor() }
+        prompter.showPanel()
+        return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if library.hasUnsavedChanges, !library.saveNow() {
+            let alert = NSAlert()
+            alert.messageText = "Some changes are unsaved"
+            alert.informativeText = "Cancel to return to your scripts and retry saving or preserve the original library."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Quit Without Saving")
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                showEditor()
+                return .terminateCancel
+            }
+        }
+        guard prompter?.isRecording == true else { return .terminateNow }
+        // Let the movie file finish, or the take is lost.
+        prompter.stopRecording { NSApp.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        prompter.stopAll()
+    }
+
+    /// Files opened before launch finished (e.g. by opening a document with the app) wait here.
+    private var pendingURLs: [URL] = []
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let prompter else { pendingURLs += urls; return }
+        for url in urls {
+            switch url.scheme {
+            case "flickerfolio", "notchpick": openLink(url)
+            default: prompter.importAndShow(url)
+            }
+        }
+        if settings.hasSeenWelcome { prompter.showPanel() }
+    }
+
+    /// `flickerfolio://show?script=Title`: put that script in the prompter. For assistants
+    /// that write scripts in the scripts folder.
+    private func openLink(_ url: URL) {
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard url.host() == "show" else { return }
+        prompter.showPanel()
+        guard let name = query.first(where: { $0.name == "script" })?.value else { return }
+        // The file may have been written a moment ago, before its change came in.
+        ScriptFolder.shared.syncNow()
+        if let script = ScriptFolder.shared.script(named: name) {
+            library.activeID = script.id
+            prompter.showHUD(script.displayTitle)
+        } else {
+            prompter.showHUD(String(localized: "No script called “\(name)”"), for: 4)
+        }
+    }
+
+    // MARK: Windows
+
+    private func makeWindow<V: View>(_ title: String, _ view: V, style: NSWindow.StyleMask) -> NSWindow {
+        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        window.title = title
+        window.styleMask = style
+        window.isReleasedWhenClosed = false
+        return window
+    }
+
+    @objc func showEditor() {
+        if editorWindow == nil {
+            let view = EditorView(library: library, settings: settings,
+                                  onRead: { [unowned self] script in
+                                      editorWindow?.miniaturize(nil)
+                                      prompter.readScript(script)
+                                  },
+                                  onSettings: { [unowned self] in showSettings() })
+            let window = makeWindow(String(localized: "Scripts", comment: "Title of the script editor window"), view,
+                                    style: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])
+            window.setContentSize(NSSize(width: 820, height: 540))
+            window.setFrameAutosaveName("Editor")
+            if !window.setFrameUsingName("Editor") { window.center() }
+            window.toolbarStyle = .unified
+            editorWindow = window
+        }
+        NSApp.activate()
+        editorWindow?.deminiaturize(nil)
+        editorWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func showSettings() {
+        if settingsWindow == nil {
+            let view = QuickSettingsView(settings: settings) { [weak self] in
+                self?.settingsWindow?.orderOut(nil)
+                self?.showAdvancedSettings()
+            }
+            settingsWindow = makeWindow("Prompter Settings", view, style: [.titled, .closable])
+        }
+        presentCentered(settingsWindow)
+    }
+
+    private func showAdvancedSettings() {
+        if advancedSettingsWindow == nil {
+            let window = makeWindow("Settings", SettingsView(settings: settings, prepareVoiceCheck: { [weak self] in
+                self?.prompter.prepareVoiceCheck() ?? false
+            }), style: [.titled, .closable])
+            (window.contentViewController as? NSHostingController<SettingsView>)?.sizingOptions = .preferredContentSize
+            advancedSettingsWindow = window
+        }
+        presentCentered(advancedSettingsWindow)
+    }
+
+    @objc private func showScriptSwitcher() {
+        let view = ScriptSwitcherView(library: library) { [weak self] script in
+            self?.scriptSwitcher?.orderOut(nil)
+            self?.prompter.readScript(script)
+        }
+        scriptSwitcher = makeWindow("Switch Script", view, style: [.titled, .closable])
+        presentCentered(scriptSwitcher)
+    }
+
+    private func presentCentered(_ window: NSWindow?) {
+        guard let window else { return }
+        NSApp.activate()
+        if let screen = prompter.panel.screen ?? statusItem.button?.window?.screen {
+            let area = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: area.midX - window.frame.width / 2,
+                                          y: area.midY - window.frame.height / 2))
+        } else {
+            window.center()
+        }
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func showWelcome() {
+        if welcomeWindow == nil {
+            let view = OnboardingView { [unowned self] in
+                settings.hasSeenWelcome = true
+                welcomeWindow?.close()
+                openStarterScript()
+            }
+            let window = makeWindow(String(localized: "Welcome to Flicker Folio"), view, style: [.titled, .closable, .fullSizeContentView])
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.center()
+            welcomeWindow = window
+        }
+        NSApp.activate()
+        welcomeWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: Actions
+
+    @objc private func togglePrompter() { prompter.togglePanel() }
+    @objc private func toggleVoice() { prompter.toggleVoice() }
+    @objc private func togglePlay() { prompter.togglePlay() }
+    @objc private func toggleRecording() { prompter.toggleRecording() }
+    @objc private func restart() { prompter.restart() }
+    @objc private func playLastTake() { prompter.playLastTake() }
+    @objc private func trashLastTake() { prompter.trashLastTake() }
+    @objc private func biggerText() { prompter.changeFontSize(2) }
+    @objc private func smallerText() { prompter.changeFontSize(-2) }
+    @objc private func faster() { prompter.changeSpeed(5) }
+    @objc private func slower() { prompter.changeSpeed(-5) }
+
+    @objc private func newScript() {
+        showEditor()
+        NotificationCenter.default.post(name: .newScript, object: nil)
+    }
+
+    @objc private func importScript() {
+        showEditor()
+        NotificationCenter.default.post(name: .importScript, object: nil)
+    }
+
+    @objc private func openStarterScript() {
+        showEditor()
+        if let starter = library.scripts.first(where: { $0.title == ScriptLibrary.welcomeTitle }) {
+            NotificationCenter.default.post(name: .selectStarterScript, object: starter.id)
+        }
+    }
+
+    @objc private func openGitHub() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/psagar786/flicker-folio")!)
+    }
+
+    @objc private func reportIssue() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/psagar786/flicker-folio/issues/new/choose")!)
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(togglePrompter):
+            item.title = prompter.isVisible ? String(localized: "Hide Prompter") : String(localized: "Show Prompter")
+        case #selector(toggleVoice):
+            item.title = prompter.listening ? String(localized: "Stop Following Voice") : String(localized: "Follow My Voice")
+        case #selector(toggleRecording):
+            item.title = prompter.isRecording ? String(localized: "Stop Recording") : String(localized: "Record Video…")
+        case #selector(togglePlay):
+            item.title = prompter.playing ? String(localized: "Pause") : String(localized: "Play")
+        case #selector(playLastTake), #selector(trashLastTake):
+            return !prompter.isRecording && !prompter.lastTake.movies.isEmpty
+        default: break
+        }
+        return true
+    }
+
+    // MARK: Menus
+
+    private func item(_ title: String.LocalizationValue, _ action: Selector, _ key: String = "",
+                      _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+        item(verbatim: String(localized: title), action, key, modifiers)
+    }
+
+    private func item(verbatim title: String, _ action: Selector, _ key: String = "",
+                      _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
+        item.target = self
+        return item
+    }
+
+    private func buildStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.image = NSImage(systemSymbolName: "text.aligncenter", accessibilityDescription: "Flicker Folio")
+        let menu = NSMenu()
+        menu.addItem(item("Show Prompter", #selector(togglePrompter)))
+        menu.addItem(.separator())
+        menu.addItem(item("Follow My Voice", #selector(toggleVoice)))
+        menu.addItem(item("Play", #selector(togglePlay)))
+        menu.addItem(item("Record Video…", #selector(toggleRecording)))
+        menu.addItem(item("Back to Top", #selector(restart)))
+        menu.addItem(.separator())
+        menu.addItem(item("Switch Script…", #selector(showScriptSwitcher)))
+        menu.addItem(item("Edit Scripts…", #selector(showEditor)))
+        menu.addItem(item(verbatim: StandardMenuTitle.settings, #selector(showSettings)))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: String(localized: "Quit Flicker Folio"), action: #selector(NSApplication.terminate(_:)),
+                                keyEquivalent: ""))
+        statusMenu = menu
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusButtonClicked(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem.button?.toolTip = "Flicker Folio · Click to show or hide the prompter. Right-click for actions."
+    }
+
+    @objc private func statusButtonClicked(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.modifierFlags.contains(.control) == true {
+            statusMenu?.popUp(positioning: nil,
+                              at: NSPoint(x: 0, y: sender.isFlipped ? sender.bounds.maxY : sender.bounds.minY),
+                              in: sender)
+        } else {
+            prompter.togglePanel()
+        }
+    }
+
+    private func buildMainMenu() {
+        let main = NSMenu()
+        typealias Std = StandardMenuTitle
+
+        let app = NSMenu()
+        app.addItem(NSMenuItem(title: String(localized: "About Flicker Folio"),
+                               action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+        app.addItem(.separator())
+        app.addItem(item(verbatim: Std.settings, #selector(showSettings), ","))
+        app.addItem(item("Welcome Guide", #selector(showWelcome)))
+        app.addItem(.separator())
+        let services = NSMenuItem(title: Std.services, action: nil, keyEquivalent: "")
+        services.submenu = NSMenu(title: Std.services)
+        NSApp.servicesMenu = services.submenu
+        app.addItem(services)
+        app.addItem(.separator())
+        app.addItem(NSMenuItem(title: String(localized: "Hide Flicker Folio"), action: #selector(NSApplication.hide(_:)),
+                               keyEquivalent: "h"))
+        let others = NSMenuItem(title: String(localized: "Hide Others"),
+                                action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        others.keyEquivalentModifierMask = [.command, .option]
+        app.addItem(others)
+        app.addItem(NSMenuItem(title: Std.showAll, action: #selector(NSApplication.unhideAllApplications(_:)),
+                               keyEquivalent: ""))
+        app.addItem(.separator())
+        app.addItem(NSMenuItem(title: String(localized: "Quit Flicker Folio"), action: #selector(NSApplication.terminate(_:)),
+                               keyEquivalent: "q"))
+        add(app, "Flicker Folio", to: main)
+
+        let file = NSMenu()
+        file.addItem(item("New Script", #selector(newScript), "n"))
+        file.addItem(item("Import…", #selector(importScript), "o"))
+        file.addItem(item("Edit Scripts", #selector(showEditor), "e"))
+        file.addItem(.separator())
+        file.addItem(NSMenuItem(title: Std.closeWindow, action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        add(file, Std.file, to: main)
+
+        let edit = NSMenu()
+        edit.addItem(NSMenuItem(title: String(localized: "Undo"), action: Selector(("undo:")), keyEquivalent: "z"))
+        let redo = NSMenuItem(title: String(localized: "Redo"), action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(redo)
+        edit.addItem(.separator())
+        edit.addItem(NSMenuItem(title: Std.cut, action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        edit.addItem(NSMenuItem(title: Std.copy, action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        edit.addItem(NSMenuItem(title: Std.paste, action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        edit.addItem(NSMenuItem(title: Std.selectAll, action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        edit.addItem(.separator())
+        let find = NSMenuItem(title: String(localized: "Find…"), action: #selector(NSResponder.performTextFinderAction(_:)),
+                              keyEquivalent: "f")
+        find.tag = NSTextFinder.Action.showFindInterface.rawValue
+        edit.addItem(find)
+        add(edit, Std.edit, to: main)
+
+        let prompterMenu = NSMenu()
+        prompterMenu.addItem(item("Show Prompter", #selector(togglePrompter), "p", [.command, .shift]))
+        prompterMenu.addItem(.separator())
+        prompterMenu.addItem(item("Follow My Voice", #selector(toggleVoice), "v", [.command, .shift]))
+        prompterMenu.addItem(item("Play", #selector(togglePlay), "\r"))
+        prompterMenu.addItem(item("Record Video…", #selector(toggleRecording), "r", [.command, .option]))
+        prompterMenu.addItem(item("Back to Top", #selector(restart), "r", [.command, .shift]))
+        prompterMenu.addItem(item("Play Last Take", #selector(playLastTake)))
+        prompterMenu.addItem(item("Move Last Take to Trash", #selector(trashLastTake)))
+        prompterMenu.addItem(.separator())
+        prompterMenu.addItem(item("Bigger Text", #selector(biggerText), "+"))
+        prompterMenu.addItem(item("Smaller Text", #selector(smallerText), "-"))
+        prompterMenu.addItem(item("Faster", #selector(faster), String(UnicodeScalar(NSUpArrowFunctionKey)!)))
+        prompterMenu.addItem(item("Slower", #selector(slower), String(UnicodeScalar(NSDownArrowFunctionKey)!)))
+        add(prompterMenu, String(localized: "Prompter", comment: "Menu bar menu with the prompter commands"), to: main)
+
+        let window = NSMenu()
+        window.addItem(NSMenuItem(title: Std.minimize, action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        window.addItem(NSMenuItem(title: String(localized: "Zoom", comment: "Window menu: zoom the window"),
+                                  action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        add(window, Std.window, to: main)
+        NSApp.windowsMenu = window
+
+        let help = NSMenu()
+        help.addItem(item("Open Starter Script", #selector(openStarterScript), "?"))
+        help.addItem(item("Flicker Folio on GitHub", #selector(openGitHub)))
+        help.addItem(item("Report an Issue…", #selector(reportIssue)))
+        add(help, Std.help, to: main)
+        NSApp.helpMenu = help
+
+        NSApp.mainMenu = main
+    }
+
+    private func add(_ menu: NSMenu, _ title: String, to main: NSMenu) {
+        let holder = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        menu.title = title
+        holder.submenu = menu
+        main.addItem(holder)
+    }
+}
+
+/// Titles of the standard menus and menu items, in the words macOS uses. They come from AppKit's
+/// own translations when AppKit shows the same language as the app (so a menu never mixes two
+/// languages), and from this app's string catalog otherwise.
+enum StandardMenuTitle {
+    static let file = appKit("File", fallback: String(localized: "File", comment: "Menu bar menu"))
+    static let edit = appKit("Edit", table: "InputManager", fallback: String(localized: "Edit", comment: "Menu bar menu"))
+    static let window = appKit("Window", fallback: String(localized: "Window", comment: "Menu bar menu"))
+    static let help = appKit("Help", fallback: String(localized: "Help", comment: "Menu bar menu"))
+    static let services = appKit("Services", table: "Services", fallback: String(localized: "Services"))
+    static let settings = appKit("Settings\\U2026", fallback: String(localized: "Settings…"))
+    static let showAll = appKit("Show All", table: "Common", fallback: String(localized: "Show All"))
+    static let closeWindow = appKit("Close Window", fallback: String(localized: "Close Window"))
+    static let cut = appKit("Cut", fallback: String(localized: "Cut"))
+    static let copy = appKit("Copy", fallback: String(localized: "Copy"))
+    static let paste = appKit("Paste", fallback: String(localized: "Paste"))
+    static let selectAll = appKit("Select All", fallback: String(localized: "Select All"))
+    static let minimize = appKit("Minimize", fallback: String(localized: "Minimize"))
+
+    private static let appKitBundle = Bundle(for: NSApplication.self)
+
+    /// AppKit and the app agree on the language (AppKit also has languages this app doesn't).
+    private static let sameLanguage: Bool = {
+        func id(_ localization: String?) -> String? {
+            guard let localization else { return nil }
+            let max = Locale.Language(identifier: localization).maximalIdentifier
+            return max.hasPrefix("no-") ? "nb-" + max.dropFirst(3) : max   // AppKit says "no" for Bokmål
+        }
+        guard let app = id(Bundle.main.preferredLocalizations.first) else { return false }
+        return app == id(appKitBundle.preferredLocalizations.first)
+    }()
+
+    private static func appKit(_ key: String, table: String = "MenuCommands", fallback: String) -> String {
+        guard sameLanguage else { return fallback }
+        let missing = "\u{0}"
+        let title = appKitBundle.localizedString(forKey: key, value: missing, table: table)
+        return title == missing || title.isEmpty ? fallback : title
+    }
+}
+
+extension Notification.Name {
+    static let selectStarterScript = Notification.Name("selectStarterScript")
+}
